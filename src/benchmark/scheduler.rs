@@ -9,6 +9,7 @@ use crate::export::ExportManager;
 use crate::options::{ExecutorKind, Options, OutputStyleOption, SortOrder};
 
 use anyhow::Result;
+use crate::output::progress_bar::get_progress_bar;
 
 pub struct Scheduler<'a> {
     commands: &'a Commands<'a>,
@@ -46,18 +47,63 @@ impl<'a> Scheduler<'a> {
 
         executor.calibrate()?;
 
-        for (number, cmd) in reference.iter().chain(self.commands.iter()).enumerate() {
-            self.results
-                .push(Benchmark::new(number, cmd, self.options, &*executor).run()?);
+        let mut benchmarks: Vec<Benchmark> = vec![];
+        let progress_bar = if self.options.output_style != OutputStyleOption::Disabled {
+            Some(get_progress_bar(
+                self.options.run_bounds.min,
+                "No time estimates; experimental mode",
+                self.options.output_style,
+            ))
+        } else {
+            None
+        };
 
-            // We export results after each individual benchmark, because
-            // we would risk losing them if a later benchmark fails.
+        for (number, cmd) in reference.iter().chain(self.commands.iter()).enumerate() {
+            benchmarks.push(Benchmark::new(number, cmd, self.options, &*executor));
+        }
+
+        for _ in 0..self.options.warmup_count {
+            for benchmark in benchmarks.iter_mut() {
+                benchmark.run_iteration(false)?;
+            }
+        }
+
+        // TODO: no runtime calc of num runs
+        for _ in 0..self.options.run_bounds.min {
+            for benchmark in benchmarks.iter_mut() {
+                benchmark.run_iteration(true)?;
+            }
+            if let Some(bar) = progress_bar.as_ref() {
+                bar.inc(1)
+            }
+        }
+
+        if let Some(bar) = progress_bar.as_ref() {
+            bar.finish_and_clear()
+        }
+
+        for benchmark in benchmarks.iter() {
+            self.results.push(benchmark.create_results()?);
+
             self.export_manager.write_results(
                 &self.results,
                 self.options.sort_order_exports,
                 true,
             )?;
         }
+
+        // for (number, cmd) in reference.iter().chain(self.commands.iter()).enumerate() {
+        //     self.results
+        //         .push(Benchmark::new(number, cmd, self.options, &*executor).run()?);
+        //
+        //     // We export results after each individual benchmark, because
+        //     // we would risk losing them if a later benchmark fails.
+        //     self.export_manager.write_results(
+        //         &self.results,
+        //         self.options.sort_order_exports,
+        //         true,
+        //     )?;
+        // }
 
         Ok(())
     }

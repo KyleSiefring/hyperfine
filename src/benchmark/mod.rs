@@ -5,7 +5,6 @@ pub mod scheduler;
 pub mod timing_result;
 
 use std::cmp;
-
 use crate::command::Command;
 use crate::options::{CmdFailureAction, ExecutorKind, Options, OutputStyleOption};
 use crate::outlier_detection::{modified_zscores, OUTLIER_THRESHOLD};
@@ -13,7 +12,6 @@ use crate::output::format::{format_duration, format_duration_unit};
 use crate::output::progress_bar::get_progress_bar;
 use crate::output::warnings::{OutlierWarningOptions, Warnings};
 use crate::parameter::ParameterNameAndValue;
-use crate::util::exit_code::extract_exit_code;
 use crate::util::min_max::{max, min};
 use crate::util::units::Second;
 use benchmark_result::BenchmarkResult;
@@ -22,7 +20,7 @@ use timing_result::TimingResult;
 use anyhow::{anyhow, Result};
 use colored::*;
 use statistical::{mean, median, standard_deviation};
-
+use crate::util::exit_code::extract_exit_code;
 use self::executor::Executor;
 
 /// Threshold for warning about fast execution time
@@ -33,6 +31,12 @@ pub struct Benchmark<'a> {
     command: &'a Command<'a>,
     options: &'a Options,
     executor: &'a dyn Executor,
+    
+    times_real: Vec<Second>,
+    times_user: Vec<Second>,
+    times_system: Vec<Second>,
+    exit_codes: Vec<Option<i32>>,
+    all_succeeded: bool,
 }
 
 impl<'a> Benchmark<'a> {
@@ -47,6 +51,12 @@ impl<'a> Benchmark<'a> {
             command,
             options,
             executor,
+
+            times_real: vec![],
+            times_user: vec![],
+            times_system: vec![],
+            exit_codes: vec![],
+            all_succeeded: true,
         }
     }
 
@@ -119,7 +129,7 @@ impl<'a> Benchmark<'a> {
     }
 
     /// Run the benchmark for a single command
-    pub fn run(&self) -> Result<BenchmarkResult> {
+    pub fn run(&mut self) -> Result<BenchmarkResult> {
         if self.options.output_style != OutputStyleOption::Disabled {
             println!(
                 "{}{}: {}",
@@ -128,50 +138,6 @@ impl<'a> Benchmark<'a> {
                 self.command.get_name_with_unused_parameters(),
             );
         }
-
-        let mut times_real: Vec<Second> = vec![];
-        let mut times_user: Vec<Second> = vec![];
-        let mut times_system: Vec<Second> = vec![];
-        let mut exit_codes: Vec<Option<i32>> = vec![];
-        let mut all_succeeded = true;
-
-        let preparation_command = self.options.preparation_command.as_ref().map(|values| {
-            let preparation_command = if values.len() == 1 {
-                &values[0]
-            } else {
-                &values[self.number]
-            };
-            Command::new_parametrized(
-                None,
-                preparation_command,
-                self.command.get_parameters().iter().cloned(),
-            )
-        });
-        let run_preparation_command = || {
-            preparation_command
-                .as_ref()
-                .map(|cmd| self.run_preparation_command(cmd))
-                .transpose()
-        };
-
-        let conclusion_command = self.options.conclusion_command.as_ref().map(|values| {
-            let conclusion_command = if values.len() == 1 {
-                &values[0]
-            } else {
-                &values[self.number]
-            };
-            Command::new_parametrized(
-                None,
-                conclusion_command,
-                self.command.get_parameters().iter().cloned(),
-            )
-        });
-        let run_conclusion_command = || {
-            conclusion_command
-                .as_ref()
-                .map(|cmd| self.run_conclusion_command(cmd))
-                .transpose()
-        };
 
         self.run_setup_command(self.command.get_parameters().iter().cloned())?;
 
@@ -188,9 +154,7 @@ impl<'a> Benchmark<'a> {
             };
 
             for _ in 0..self.options.warmup_count {
-                let _ = run_preparation_command()?;
-                let _ = self.executor.run_command_and_measure(self.command, None)?;
-                let _ = run_conclusion_command()?;
+                self.run_iteration(false)?;
                 if let Some(bar) = progress_bar.as_ref() {
                     bar.inc(1)
                 }
@@ -211,22 +175,23 @@ impl<'a> Benchmark<'a> {
             None
         };
 
-        let preparation_result = run_preparation_command()?;
-        let preparation_overhead =
-            preparation_result.map_or(0.0, |res| res.time_real + self.executor.time_overhead());
+        // let preparation_result = run_preparation_command()?;
+        // let preparation_overhead =
+        //     preparation_result.map_or(0.0, |res| res.time_real + self.executor.time_overhead());
+        let preparation_overhead = 0.0;
 
         // Initial timing run
-        let (res, status) = self.executor.run_command_and_measure(self.command, None)?;
-        let success = status.success();
+        self.run_iteration(true)?;
+        let first_time = self.times_real.first().map_or(0.0, |res| res + self.executor.time_overhead());
 
-        let conclusion_result = run_conclusion_command()?;
-        let conclusion_overhead =
-            conclusion_result.map_or(0.0, |res| res.time_real + self.executor.time_overhead());
+        // let conclusion_result = run_conclusion_command()?;
+        // let conclusion_overhead =
+        //     conclusion_result.map_or(0.0, |res| res.time_real + self.executor.time_overhead());
+        let conclusion_overhead = 0.0;
 
         // Determine number of benchmark runs
         let runs_in_min_time = (self.options.min_benchmarking_time
-            / (res.time_real
-                + self.executor.time_overhead()
+            / (first_time
                 + preparation_overhead
                 + conclusion_overhead)) as u64;
 
@@ -244,12 +209,7 @@ impl<'a> Benchmark<'a> {
         let count_remaining = count - 1;
 
         // Save the first result
-        times_real.push(res.time_real);
-        times_user.push(res.time_user);
-        times_system.push(res.time_system);
-        exit_codes.push(extract_exit_code(status));
-
-        all_succeeded = all_succeeded && success;
+        // self.push_iteration(res, status);
 
         // Re-configure the progress bar
         if let Some(bar) = progress_bar.as_ref() {
@@ -261,10 +221,10 @@ impl<'a> Benchmark<'a> {
 
         // Gather statistics (perform the actual benchmark)
         for _ in 0..count_remaining {
-            run_preparation_command()?;
+            // run_preparation_command()?;
 
             let msg = {
-                let mean = format_duration(mean(&times_real), self.options.time_unit);
+                let mean = format_duration(mean(&self.times_real), self.options.time_unit);
                 format!("Current estimate: {}", mean.to_string().green())
             };
 
@@ -272,41 +232,37 @@ impl<'a> Benchmark<'a> {
                 bar.set_message(msg.to_owned())
             }
 
-            let (res, status) = self.executor.run_command_and_measure(self.command, None)?;
-            let success = status.success();
-
-            times_real.push(res.time_real);
-            times_user.push(res.time_user);
-            times_system.push(res.time_system);
-            exit_codes.push(extract_exit_code(status));
-
-            all_succeeded = all_succeeded && success;
+            self.run_iteration(true)?;
 
             if let Some(bar) = progress_bar.as_ref() {
                 bar.inc(1)
             }
 
-            run_conclusion_command()?;
+            // run_conclusion_command()?;
         }
 
         if let Some(bar) = progress_bar.as_ref() {
             bar.finish_and_clear()
         }
 
+        self.create_results()
+    }
+
+    pub fn create_results(&self) -> Result<BenchmarkResult> {
         // Compute statistical quantities
-        let t_num = times_real.len();
-        let t_mean = mean(&times_real);
-        let t_stddev = if times_real.len() > 1 {
-            Some(standard_deviation(&times_real, Some(t_mean)))
+        let t_num = self.times_real.len();
+        let t_mean = mean(&self.times_real);
+        let t_stddev = if self.times_real.len() > 1 {
+            Some(standard_deviation(&self.times_real, Some(t_mean)))
         } else {
             None
         };
-        let t_median = median(&times_real);
-        let t_min = min(&times_real);
-        let t_max = max(&times_real);
+        let t_median = median(&self.times_real);
+        let t_min = min(&self.times_real);
+        let t_max = max(&self.times_real);
 
-        let user_mean = mean(&times_user);
-        let system_mean = mean(&times_system);
+        let user_mean = mean(&self.times_user);
+        let system_mean = mean(&self.times_system);
 
         // Formatting and console output
         let (mean_str, time_unit) = format_duration_unit(t_mean, self.options.time_unit);
@@ -318,7 +274,7 @@ impl<'a> Benchmark<'a> {
         let system_str = format_duration(system_mean, Some(time_unit));
 
         if self.options.output_style != OutputStyleOption::Disabled {
-            if times_real.len() == 1 {
+            if self.times_real.len() == 1 {
                 println!(
                     "  Time ({} ≡):        {:>8}  {:>8}     [User: {}, System: {}]",
                     "abs".green().bold(),
@@ -356,18 +312,18 @@ impl<'a> Benchmark<'a> {
 
         // Check execution time
         if matches!(self.options.executor_kind, ExecutorKind::Shell(_))
-            && times_real.iter().any(|&t| t < MIN_EXECUTION_TIME)
+            && self.times_real.iter().any(|&t| t < MIN_EXECUTION_TIME)
         {
             warnings.push(Warnings::FastExecutionTime);
         }
 
         // Check program exit codes
-        if !all_succeeded {
+        if !self.all_succeeded {
             warnings.push(Warnings::NonZeroExitCode);
         }
 
         // Run outlier detection
-        let scores = modified_zscores(&times_real);
+        let scores = modified_zscores(&self.times_real);
 
         let outlier_warning_options = OutlierWarningOptions {
             warmup_in_use: self.options.warmup_count > 0,
@@ -382,7 +338,7 @@ impl<'a> Benchmark<'a> {
 
         if scores[0] > OUTLIER_THRESHOLD {
             warnings.push(Warnings::SlowInitialRun(
-                times_real[0],
+                self.times_real[0],
                 outlier_warning_options,
             ));
         } else if scores.iter().any(|&s| s.abs() > OUTLIER_THRESHOLD) {
@@ -413,8 +369,8 @@ impl<'a> Benchmark<'a> {
             system: system_mean,
             min: t_min,
             max: t_max,
-            times: Some(times_real),
-            exit_codes,
+            times: Some(self.times_real.clone()),
+            exit_codes: self.exit_codes.clone(),
             parameters: self
                 .command
                 .get_parameters()
@@ -422,5 +378,61 @@ impl<'a> Benchmark<'a> {
                 .map(|(name, value)| (name.to_string(), value.to_string()))
                 .collect(),
         })
+    }
+
+    pub fn run_iteration(&mut self, record: bool) -> Result<()> {
+        let preparation_command = self.options.preparation_command.as_ref().map(|values| {
+            let preparation_command = if values.len() == 1 {
+                &values[0]
+            } else {
+                &values[self.number]
+            };
+            Command::new_parametrized(
+                None,
+                preparation_command,
+                self.command.get_parameters().iter().cloned(),
+            )
+        });
+        let run_preparation_command = || {
+            preparation_command
+                .as_ref()
+                .map(|cmd| self.run_preparation_command(cmd))
+                .transpose()
+        };
+
+        let conclusion_command = self.options.conclusion_command.as_ref().map(|values| {
+            let conclusion_command = if values.len() == 1 {
+                &values[0]
+            } else {
+                &values[self.number]
+            };
+            Command::new_parametrized(
+                None,
+                conclusion_command,
+                self.command.get_parameters().iter().cloned(),
+            )
+        });
+
+        run_preparation_command()?;
+
+        let (res, status) = self.executor.run_command_and_measure(self.command, None)?;
+        if record {
+            self.times_real.push(res.time_real);
+            self.times_user.push(res.time_user);
+            self.times_system.push(res.time_system);
+            self.exit_codes.push(extract_exit_code(status));
+
+            self.all_succeeded = self.all_succeeded && status.success();
+        }
+
+        let run_conclusion_command = || {
+            conclusion_command
+                .as_ref()
+                .map(|cmd| self.run_conclusion_command(cmd))
+                .transpose()
+        };
+        run_conclusion_command()?;
+
+        Ok(())
     }
 }
