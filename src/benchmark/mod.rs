@@ -268,6 +268,7 @@ impl<'a> Benchmark<'a> {
         let (mean_str, time_unit) = format_duration_unit(t_mean, self.options.time_unit);
         let min_str = format_duration(t_min, Some(time_unit));
         let max_str = format_duration(t_max, Some(time_unit));
+        let median_str = format_duration(t_median, Some(time_unit));
         let num_str = format!("{t_num} runs");
 
         let user_str = format_duration(user_mean, Some(time_unit));
@@ -294,6 +295,11 @@ impl<'a> Benchmark<'a> {
                     stddev_str.green(),
                     user_str.blue(),
                     system_str.blue()
+                );
+                println!(
+                    "       ({}):       {:>8}",
+                    "median".green().bold(),
+                    median_str.green().bold(),
                 );
 
                 println!(
